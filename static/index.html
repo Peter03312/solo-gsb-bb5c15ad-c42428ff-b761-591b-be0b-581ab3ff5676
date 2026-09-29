@@ -229,6 +229,51 @@
         <div id="doorOutput"></div>
       </div>
 
+      <div class="panel wheel-panel">
+        <div class="sim-head">
+          <h2>🛞 轮组承载试算 <span id="wheelStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelWheel" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnWheel" class="btn btn-run" type="button">开始轮组试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          输入<b>台面内</b>的四个轮位坐标（左/右轮位 X、前/后轮位 Y，单位 mm）与<b>四轮额定载荷</b>
+          （左前 / 右前 / 左后 / 右后，单位 kg）。后端以现有架体计算结果中的<b>底层非悬空立柱落点与实载</b>
+          为点载荷，按矩形四轮<b>双向杠杆（双线性）比例</b>分配反力；落点越出轮组矩形时按比例<b>外推</b>，
+          <b>负反力不截零</b>并单独告警。面板列出逐轮反力、利用率、超载/负反力风险，并核对
+          <b>四轮反力之和与 X / Y 力矩</b>是否与点载荷一致。试算只读取当前架体、<span class="hl">不写盘</span>；
+          轮距不正、轮位越出台面、额定载荷非正返回参数错误；底层没有正载荷时无法试算；<b>编辑架体后旧结果立即失效</b>。
+        </p>
+        <div class="wheel-form">
+          <label>左轮位 X (mm)
+            <input type="number" step="any" id="wheelXLeft" value="150" />
+          </label>
+          <label>右轮位 X (mm)
+            <input type="number" step="any" id="wheelXRight" value="1150" />
+          </label>
+          <label>前轮位 Y (mm)
+            <input type="number" step="any" id="wheelYFront" value="750" />
+          </label>
+          <label>后轮位 Y (mm)
+            <input type="number" step="any" id="wheelYBack" value="150" />
+          </label>
+          <label>左前轮额定 (kg)
+            <input type="number" step="any" id="wheelCapLF" value="600" min="0" />
+          </label>
+          <label>右前轮额定 (kg)
+            <input type="number" step="any" id="wheelCapRF" value="600" min="0" />
+          </label>
+          <label>左后轮额定 (kg)
+            <input type="number" step="any" id="wheelCapLB" value="600" min="0" />
+          </label>
+          <label>右后轮额定 (kg)
+            <input type="number" step="any" id="wheelCapRB" value="600" min="0" />
+          </label>
+        </div>
+        <div id="wheelOutput"></div>
+      </div>
+
       <div class="bottom-grid">
         <div class="panel issues-panel">
           <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>
