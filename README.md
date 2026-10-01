@@ -121,6 +121,7 @@ REST API 与页面同端口、以 `/api/...` 为前缀，例如：
 > - 抗倾覆试算：`POST http://localhost:8000/api/overturn`（只读）
 > - 逐层装货顺序规划：`POST http://localhost:8000/api/loading-sequence`（只读）
 > - 连续窑门通行试算：`POST http://localhost:8000/api/door-passage`（只读）
+> - 轮组承载试算：`POST http://localhost:8000/api/wheel-load`（只读）
 > - 完整接口清单见下方「HTTP 接口」一节
 
 首次启动会自动把内置 **示例数据**（`data/sample_state.json`，一个 3 层窑车，
@@ -252,6 +253,26 @@ HOST_PORT=9000
      开口沿、本门区间 / 扩张区间 / 交集、**左 / 右 / 顶部净空**与判定；
    - 试算**只读、不写盘**；门参数改动后防抖自动重算，**架体或门参数一改变旧
      结果立即标记失效**（状态徽章变「结果已失效」），点「✕ 清空试算」可收起。
+9. **轮组承载试算**：在「🚪 连续窑门通行试算」下方的「🛞 轮组承载试算」面板录入
+   **左轮位 X / 右轮位 X / 前轮位 Y / 后轮位 Y**（mm，均须在台面 `[0,W]×[0,D]`
+   内，且左右 X 不等、前后 Y 不等）与**四轮额定载荷**（kg，左前/右前/左后/右后，
+   均须为正），点击「开始轮组试算」：
+   - 后端以**现有整架计算结果**中**底层非悬空立柱**的落点与实载为点载荷（同坐标
+     落点合并为一个点），把台面视为刚性板、四轮为矩形刚性支撑，按**双向杠杆
+     （双线性）比例**把每个点载荷分到四轮；
+   - 落点越出轮组矩形时**允许外推**：权重取负，相应轮反力为**负**，表示该轮需要
+     向下拉住台面（实际会悬空/上跳）。系统**绝不把负反力截为零**，而是在面板用
+     「负反力」标签与风险横幅原样报出；
+   - 面板逐轮列出**反力、额定载荷、利用率**与**超载 / 负反力**判定，展开
+     「底层点载荷与四轮分配权重」可核对每个点的四轮权重（矩形外的点标注
+     「矩形外·外推」）；
+   - 底部**平衡核对**表给出**竖向力 ΣF**、绕 X 轴力矩 **momentX = ΣP·y**、绕 Y 轴
+     力矩 **momentY = ΣP·x** 的「输入点载荷合计 / 四轮反力合计 / 差值 / 是否一致」，
+     任一项不一致会显式标红（正常应全部 ✓）；
+   - **轮距为 0、轮位越出台面、额定载荷非正或坐标非数值**时顶部显示**参数错误**
+     （对应 HTTP 400）；**底层没有正载荷的非悬空立柱**时显示**无法试算**及原因；
+   - 试算**只读、不写盘**；轮位/额定参数改动后防抖自动重算，**一编辑架体旧结果
+     立即失效**，点「✕ 清空试算」可收起。
 
 ---
 
@@ -286,7 +307,82 @@ python -m pytest -q
 | `POST` | `/api/overturn` | 层架抗倾覆试算（只读）：body `{"state": 架体JSON(可省), "ax": 0.1, "ay": 0}`（水平加速度分量，单位 g，默认 0）；按各层累计高度/棚板中心求整架重心 `cg(x,y,z)` 与 `totalWeight`，以底层非悬空立柱落点凸包为 `polygon`，投影按 `(ax·Gz, ay·Gz)` 平移得 `projection`，返回到支撑边界的带符号最短距离 `margin`（mm，内正/边界 0/外负）与 `verdict`（`stable`/`critical`/`overturn`），附 `shift`、`supportPoints` 与逐层质点明细；落点凸包面积为 0、任一层无有效承托、总重为 0 或空架时 `evaluable=false` 并给出 `reason`、`unsupportedLayers`；加速度非数值返回 400；**不写盘、不改已保存状态** |
 | `POST` | `/api/loading-sequence` | 逐层装货顺序规划（只读）：body `{"state": 架体JSON(可省), "ax": 0.1, "ay": 0}`（水平加速度分量，单位 g，默认 0）；保留全部棚板自重、坯件先全部置零，再取坯件重量大于零的层（`candidates`，至多 12）按整层一次加入，对各已装子集（含初始状态）求与 `/api/overturn` 相同的带符号裕量，用位掩码动态规划求全过程最小裕量最大的加入顺序 `order`（同分按层序号字典序），返回逐步 `steps`（新增层/累计坯件重量/总重/重心/投影/裕量/`verdict`/`stable`）、`minMargin`、`minMarginStep` 与 `allStable`（任一步非正即 false）；无有效承托、底层支撑凸包退化、初始棚板总重为 0、空架或无可装层、候选层超过 12 时 `planable=false` 并给出 `reason`；加速度非数值返回 400；**不写盘、不改已保存状态** |
 | `POST` | `/api/door-passage` | 连续窑门通行试算（只读）：body `{"state": 架体JSON(可省), "doors": [{center,width,height,maxShift}, ...]}`，窑门按行进顺序排列，字段为开口横向中心、宽度、高度与进入该门前本段最大横移量（单位 mm），首门从横移 0 出发；由台面与各棚板 X 向跨度给 `profile`（`totalHeight`=累加层高、`envelope`、逐件 `slabs`），逐门返回本门可通过横移闭区间 `interval`、上一可达区间扩张后的 `reachExpanded`、两者交集 `reachable` 与阻断信息；门高 < 最高点时 `blockReason="height"` 直接阻断（无 `interval`），本门区间自身为空为 `"width"`，扩张后与本门区间无交为 `"reach"`（附 `conflict`：两个区间与缺口）；首次空交集即 `passable=false`、`blockedAt` 指向阻断门、其后各门 `evaluated=false`；全程可达时 `positions` 给出回溯的每门选定横移 `shift`、本段移动 `move`（≤ `maxShift`）与左/右/顶部净空 `clearance`；空门列表按可达处理（附 `note`）；没有任何层时 `evaluable=false` 并给出 `reason`；`doors` 非数组、字段非有限数值、宽度/高度非正或横移量为负返回 400；**不写盘、不改已保存状态** |
+| `POST` | `/api/wheel-load` | 轮组承载试算（只读）：body `{"state": 架体JSON(可省), "wheels": {xLeft,xRight,yFront,yBack, ratedLoad}}`，四个轮位为台面内的左右轮位 X 坐标与前后轮位 Y 坐标（mm），`ratedLoad` 为四轮额定载荷（kg，接受标量＝四轮相同、长度 4 数组＝左前/右前/左后/右后、或 `{LF,RF,LB,RB}`）；以**现有整架计算结果**中**底层非悬空立柱**的落点与实载为点载荷（同坐标落点合并），把台面视为刚性板、四轮为矩形刚性支撑，按双向杠杆（双线性）比例把每个点载荷分到四轮——落点越出轮组矩形时**允许外推**，负权重/负反力**绝不截为零**；返回逐轮 `wheels`（坐标、`reaction`、`ratedLoad`、`utilization`、`overloaded`、`negative`）、逐点 `pointLoads`（权重与四轮 `contributions`、`outside` 外推标记）、载荷合力中心 `loadCenter`、风险汇总 `risks`（`overloadedWheels`/`negativeWheels`/`extrapolated`）与平衡核对 `checks`（`force`、绕 X 轴 `momentX=ΣP·y`、绕 Y 轴 `momentY=ΣP·x` 的输入合计/反力合计/差值/是否一致，`balanced`）；**底层没有正载荷**时 `evaluable=false` 并给 `reason`；**轮距为 0**（左右 X 相同或前后 Y 相同）、**轮位越出台面** `[0,W]×[0,D]`、**额定载荷非正**或字段非数值返回 400；**只计算，不写盘，不改已保存状态，编辑架体后旧结果失效** |
 | `POST` | `/api/reset` | 恢复内置示例数据 |
+### 轮组承载试算调用示例
+
+`POST /api/wheel-load` 的 body 为 `{"state": 架体JSON(可省), "wheels": {...}}`：
+省略 `state` 时对**当前已保存架体**试算；`wheels.ratedLoad` 可写为标量、
+长度 4 数组（左前/右前/左后/右后）或 `{LF,RF,LB,RB}`。
+
+```bash
+# 用当前已保存架体，四轮额定均为 600 kg（省略 state）
+curl -s -X POST http://localhost:8000/api/wheel-load \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "wheels": {
+      "xLeft": 100, "xRight": 1200,
+      "yFront": 800, "yBack": 100,
+      "ratedLoad": 600
+    }
+  }'
+
+# 随请求提交架体，四轮额定分别给定（顺序：LF, RF, LB, RB）
+curl -s -X POST http://localhost:8000/api/wheel-load \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "state": { "car": {"w": 1300, "d": 900}, "layers": [ /* ... 与 /api/state 相同 ... */ ] },
+    "wheels": {
+      "xLeft": 100, "xRight": 1200,
+      "yFront": 800, "yBack": 100,
+      "ratedLoad": [600, 600, 600, 600]
+    }
+  }'
+```
+
+成功（HTTP 200）响应节选（逐轮反力/利用率/风险 + 力与 X/Y 力矩平衡核对）：
+
+```json
+{
+  "ok": true,
+  "evaluable": true,
+  "car": {"name": "窑车台面", "w": 1300.0, "d": 900.0},
+  "layout": {"xLeft": 100.0, "xRight": 1200.0, "yFront": 800.0, "yBack": 100.0,
+             "trackX": 1100.0, "wheelbaseY": 700.0},
+  "pointLoadCount": 5,
+  "pointLoads": [
+    {"x": 150.0, "y": 150.0, "load": 396.0, "outside": false,
+     "weights": {"LF": 0.84, "RF": 0.09, "LB": 0.06, "RB": 0.01},
+     "posts": [{"layer": 0, "post": "P1", "label": "第一层（底层）·P1"}]}
+  ],
+  "loadCenter": {"x": 650.0, "y": 450.0, "insideWheelRect": true},
+  "wheels": [
+    {"id": "LF", "name": "左前轮", "x": 100.0, "y": 800.0,
+     "ratedLoad": 600.0, "reaction": 495.0, "utilization": 0.83,
+     "overloaded": false, "negative": false}
+  ],
+  "checks": {
+    "force":   {"applied": 1980.0, "reaction": 1980.0, "difference": 0.0, "ok": true, "unit": "kg"},
+    "momentX": {"applied": 891000.0, "reaction": 891000.0, "difference": 0.0, "ok": true,
+                "unit": "kg·mm", "about": "X 轴（ΣP·y）"},
+    "momentY": {"applied": 1287000.0, "reaction": 1287000.0, "difference": 0.0, "ok": true,
+                "unit": "kg·mm", "about": "Y 轴（ΣP·x）"},
+    "balanced": true
+  },
+  "risks": {"overloadedWheels": [], "negativeWheels": [],
+            "extrapolated": false, "outsidePointCount": 0,
+            "anyOverloaded": false, "anyNegative": false}
+}
+```
+
+参数错误（轮距为 0 / 轮位越出台面 / 额定载荷非正 / 字段非数值）返回 HTTP 400：
+
+```json
+{ "error": "坐标越出台面：右轮位 X 坐标 xRight=1400.0 mm 不在台面 X 向 [0, 1300.0] mm 内" }
+```
+
+底层没有正载荷的非悬空立柱时 HTTP 仍为 200，但 `evaluable=false` 并给出 `reason`。
+该接口与其它试算接口一样**只读不写盘**，不修改已保存架体。
 
 ## 载荷模型与约定
 
@@ -372,21 +468,37 @@ python -m pytest -q
   `DOOR_PASSAGE_EPS=1e-9`）。空门列表按全程可达（附 `note`）；没有任何层时
   `evaluable=false`；门参数非有限数值、宽/高非正、横移为负抛 ValueError（API 400）。
   整个过程只读、不修改输入、不写盘。
+- 轮组承载：`POST /api/wheel-load`（或 `calc.wheel_load_trial(state, wheels)`）
+  围绕**现有整架计算结果**做轮组试算：先按原模型重算整架，取第 0 层（底层）
+  **非悬空且实载为正**的立柱，按落点 `(x,y)` 合并为台面点载荷 `P_k`（悬空柱不
+  承载、丢失载荷不下传，故天然不计入）。四轮为矩形 `x∈{xL,xR}`、`y∈{yB,yF}`，
+  把台面视为刚性板、四轮为刚性四点支撑，每个点载荷按**双向杠杆（双线性）权重**
+  分配：左权重 `a=(xR−x)/(xR−xL)`、前权重 `c=(y−yB)/(yF−yB)`，则
+  `R_LF=P·a·c`、`R_RF=P·(1−a)c`、`R_LB=P·a(1−c)`、
+  `R_RB=P·(1−a)(1−c)`，四轮权重恒等 1，自动满足 `ΣR=ΣP`、`ΣR·x=ΣP·x`、
+  `ΣR·y=ΣP·y`。落点在轮组矩形外时权重为负（**外推**），**负反力原样保留**
+  （表示该轮需下拉力、有车轮悬空风险，严禁截零）。输出逐轮反力、利用率
+  `reaction/ratedLoad`、`overloaded`/`negative` 标记、逐点权重与外推标记、合力
+  中心，并对竖向力与 X/Y 两向力矩分别做输入点载荷 ↔ 四轮反力的**平衡核对**
+  （容差 `max(1e-6·量级, 0.01)`，单位分别 kg 与 kg·mm）。`xL=xR` 或 `yF=yB`
+  （轮距 0）、任一轮位越出台面 `[0,car.w]×[0,car.d]`、额定载荷非正或参数非有限
+  数值抛 ValueError（API 400）；底层没有正载荷时返回 `evaluable=false`。
+  整个过程只读、不修改输入、不写盘；编辑架体后旧结果由前端标记失效。
 
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── calc.py          # 载荷分摊/判定 + 失效推演 + 加柱建议 + 减载配额 + 抗倾覆试算 + 逐层装货顺序规划 + 连续窑门通行试算核心算法（纯函数，可独立测试）
-│   └── server.py        # Flask：静态页面 + 状态持久化/推演/加柱建议/减载/抗倾覆/装货顺序规划/窑门通行 API（启动时初始化 state.json）
+│   ├── calc.py          # 载荷分摊/判定 + 失效推演 + 加柱建议 + 减载配额 + 抗倾覆试算 + 逐层装货顺序规划 + 连续窑门通行试算 + 轮组承载试算核心算法（纯函数，可独立测试）
+│   └── server.py        # Flask：静态页面 + 状态持久化/推演/加柱建议/减载/抗倾覆/装货顺序规划/窑门通行/轮组承载 API（启动时初始化 state.json）
 ├── static/
-│   ├── index.html       # 单页界面（录入 + 俯视/侧视图 + 告警 + 溯源 + 失效推演 + 加柱建议 + 减载/抗倾覆/装货顺序规划/窑门通行试算面板）
-│   ├── app.js           # 原生 JS：编辑器、Canvas 视图、失效推演、加柱/减载/抗倾覆/装货顺序规划/窑门通行试算与预览、请求与离线兜底重算
+│   ├── index.html       # 单页界面（录入 + 俯视/侧视图 + 告警 + 溯源 + 失效推演 + 加柱建议 + 减载/抗倾覆/装货顺序规划/窑门通行/轮组承载试算面板）
+│   ├── app.js           # 原生 JS：编辑器、Canvas 视图、失效推演、加柱/减载/抗倾覆/装货顺序规划/窑门通行/轮组承载试算与预览、请求与离线兜底重算
 │   └── style.css
 ├── data/
 │   └── sample_state.json# 内置示例（悬空/重叠/超载三类工况）
-├── tests/test_calc.py   # 核心算法单元测试（含失效推演、加柱建议、减载配额、抗倾覆试算、装货顺序规划、窑门通行试算）
+├── tests/test_calc.py   # 核心算法单元测试（含失效推演、加柱建议、减载配额、抗倾覆试算、装货顺序规划、窑门通行试算、轮组承载试算）
 ├── Dockerfile           # 依赖与示例数据随镜像一起发布
 ├── docker-compose.yml   # 一条命令启动 + 数据卷持久化
 └── requirements.txt

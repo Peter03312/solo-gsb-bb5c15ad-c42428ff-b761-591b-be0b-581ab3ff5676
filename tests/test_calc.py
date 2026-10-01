@@ -17,6 +17,7 @@ from app.calc import (  # noqa: E402
     overturn_check,
     simulate,
     suggest_posts,
+    wheel_load_trial,
 )
 
 SAMPLE = os.path.join(
@@ -1459,6 +1460,279 @@ class DoorPassageTests(unittest.TestCase):
         self.assertTrue(r["passable"])
         self.assertEqual(r["profile"]["totalHeight"], 960.0)
         self.assertEqual([p["shift"] for p in r["positions"]], [-30.0, -30.0])
+
+
+class WheelLoadTrialTests(unittest.TestCase):
+    """轮组承载试算：矩形四轮双向杠杆分配 + 平衡核对 + 参数校验。"""
+
+    def _rack(self, posts, car=(1000, 800), board_load=(100, 0)):
+        """单底层架体：棚板自重 weight、坯件 wareWeight，底层立柱 posts 落在台面。"""
+        weight, ware = board_load
+        return {
+            "car": {"w": car[0], "d": car[1]},
+            "layers": [
+                {
+                    "name": "底层",
+                    "height": 300,
+                    "board": {"x": 0, "y": 0, "w": car[0], "d": car[1], "weight": weight},
+                    "wareWeight": ware,
+                    "posts": posts,
+                }
+            ],
+        }
+
+    def _wheels(self, **over):
+        w = {"xLeft": 100, "xRight": 900, "yFront": 700, "yBack": 100, "ratedLoad": 500}
+        w.update(over)
+        return w
+
+    def _by_id(self, r):
+        return {w["id"]: w for w in r["wheels"]}
+
+    def test_centered_single_point_equal_quarter(self):
+        # 单一点载荷落在轮组矩形中心：四轮各 1/4
+        state = self._rack([{"id": "P1", "x": 500, "y": 400, "capacity": 0}])
+        r = wheel_load_trial(state, self._wheels())
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["pointLoadCount"], 1)
+        self.assertEqual(r["pointLoads"][0]["load"], 100.0)
+        for wid in ("LF", "RF", "LB", "RB"):
+            self.assertEqual(self._by_id(r)[wid]["reaction"], 25.0)
+            self.assertFalse(self._by_id(r)[wid]["overloaded"])
+            self.assertFalse(self._by_id(r)[wid]["negative"])
+        self.assertTrue(r["checks"]["balanced"])
+
+    def test_corner_point_goes_to_one_wheel(self):
+        # 点载荷与左前轮重合：全部落到 LF，其余三轮为 0
+        state = self._rack([{"id": "P1", "x": 100, "y": 700, "capacity": 0}])
+        r = wheel_load_trial(state, self._wheels())
+        w = self._by_id(r)
+        self.assertEqual(w["LF"]["reaction"], 100.0)
+        self.assertEqual(w["RF"]["reaction"], 0.0)
+        self.assertEqual(w["LB"]["reaction"], 0.0)
+        self.assertEqual(w["RB"]["reaction"], 0.0)
+        # 点载荷在轮组矩形边界上不算外推
+        self.assertFalse(r["pointLoads"][0]["outside"])
+        self.assertFalse(r["risks"]["extrapolated"])
+        self.assertTrue(r["checks"]["balanced"])
+
+    def test_bilinear_lever_ratio_offcenter(self):
+        # P=100 在 (300,250)：左权重 a=(900-300)/800=0.75，前权重 c=(250-100)/600=0.25
+        state = self._rack([{"id": "P1", "x": 300, "y": 250, "capacity": 0}])
+        r = wheel_load_trial(state, self._wheels())
+        w = self._by_id(r)
+        self.assertAlmostEqual(w["LF"]["reaction"], 18.75, places=6)
+        self.assertAlmostEqual(w["RF"]["reaction"], 6.25, places=6)
+        self.assertAlmostEqual(w["LB"]["reaction"], 56.25, places=6)
+        self.assertAlmostEqual(w["RB"]["reaction"], 18.75, places=6)
+        # 利用率输出保留两位小数
+        self.assertAlmostEqual(w["LF"]["utilization"], 18.75 / 500, places=2)
+        self.assertTrue(r["checks"]["balanced"])
+
+    def test_swapped_orientation_still_rectangle(self):
+        # 允许用户把"前/后""左/右"坐标反着填：只要 X/Y 各自不相等即可，分配等价
+        state = self._rack([{"id": "P1", "x": 500, "y": 400, "capacity": 0}])
+        r = wheel_load_trial(
+            state,
+            self._wheels(xLeft=900, xRight=100, yFront=100, yBack=700),
+        )
+        self.assertTrue(r["evaluable"])
+        for wid in ("LF", "RF", "LB", "RB"):
+            self.assertEqual(self._by_id(r)[wid]["reaction"], 25.0)
+
+    def test_extrapolation_keeps_negative_reactions(self):
+        # 轮组挤在台面中部 [600,700]×[400,500]，底层点全部在轮组矩形外；
+        # 负反力必须原样报出，绝不截为零，且力/力矩仍平衡
+        state = self._rack(
+            [
+                {"id": "P1", "x": 100, "y": 100, "capacity": 0},
+                {"id": "P2", "x": 900, "y": 700, "capacity": 0},
+            ],
+            board_load=(0, 200),
+        )  # 两根立柱均摊 → 每个点 100 kg
+        r = wheel_load_trial(state, self._wheels(xLeft=600, xRight=700, yFront=500, yBack=400))
+        self.assertTrue(r["evaluable"])
+        self.assertTrue(r["risks"]["extrapolated"])
+        self.assertEqual(r["risks"]["outsidePointCount"], 2)
+        self.assertTrue(all(p["outside"] for p in r["pointLoads"]))
+        w = self._by_id(r)
+        # 每个点 100 kg，逐点按双向杠杆分配：
+        # 点1 (100,100)：a=6, c=-3 → 100·(a c, (1-a)c, a(1-c), (1-a)(1-c))
+        #                         = (-1800, 2100, 6000, -6300)
+        # 点2 (900,700)：a=-2, c=3 → 100·(...) = (-600, 300, -3200, 3700)
+        # 合计：LF=-2400, RF=2400, LB=2800, RB=-2600；Σ=200（=总载），负反力原样保留
+        self.assertAlmostEqual(w["LF"]["reaction"], -2400.0, places=4)
+        self.assertAlmostEqual(w["RF"]["reaction"], 2400.0, places=4)
+        self.assertAlmostEqual(w["LB"]["reaction"], 2800.0, places=4)
+        self.assertAlmostEqual(w["RB"]["reaction"], -2600.0, places=4)
+        self.assertTrue(r["risks"]["anyNegative"])
+        self.assertEqual(set(r["risks"]["negativeWheels"]), {"LF", "RB"})
+        self.assertTrue(r["checks"]["balanced"])
+
+    def test_centroid_outside_rectangle_causes_wheel_pull_off(self):
+        # 轮组集中在左侧 [50,150]，载荷合力在 x=500：左轮反力为大负值、右轮超载
+        state = self._rack(
+            [{"id": "P1", "x": 500, "y": 400, "capacity": 0}],
+            board_load=(0, 400),
+        )
+        r = wheel_load_trial(state, self._wheels(xLeft=50, xRight=150, ratedLoad=800))
+        w = self._by_id(r)
+        # 点 400 kg 在 x=500、轮组 [50,150]：左权重 a=(150-500)/100=-3.5，右权重 4.5；
+        # 前/后权重各 0.5 → 左轮 400·(-3.5)·0.5=-700（负反力）、右轮 400·4.5·0.5=900（>800 超载）
+        self.assertLess(w["LF"]["reaction"], 0)
+        self.assertLess(w["LB"]["reaction"], 0)
+        self.assertGreater(w["RF"]["reaction"], 800)
+        self.assertGreater(w["RB"]["reaction"], 800)
+        self.assertTrue(r["risks"]["anyOverloaded"])
+        self.assertFalse(r["loadCenter"]["insideWheelRect"])
+        self.assertTrue(r["checks"]["balanced"])
+
+    def test_overload_detection_and_utilization(self):
+        state = self._rack([{"id": "P1", "x": 100, "y": 700, "capacity": 0}],
+                           board_load=(400, 0))
+        r = wheel_load_trial(state, self._wheels(ratedLoad=300))
+        w = self._by_id(r)
+        self.assertTrue(w["LF"]["overloaded"])
+        self.assertEqual(w["LF"]["reaction"], 400.0)
+        self.assertAlmostEqual(w["LF"]["utilization"], 400 / 300, places=2)
+        self.assertEqual(r["risks"]["overloadedWheels"], ["LF"])
+
+    def test_rated_load_array_and_object_forms(self):
+        # 400 kg 全部落在左前轮（与 LF 重合）：额定 100 即超载
+        state = self._rack([{"id": "P1", "x": 100, "y": 700, "capacity": 0}],
+                           board_load=(400, 0))
+        r_arr = wheel_load_trial(state, self._wheels(ratedLoad=[100, 500, 500, 500]))
+        self.assertTrue(self._by_id(r_arr)["LF"]["overloaded"])
+        r_obj = wheel_load_trial(
+            state, self._wheels(ratedLoad={"LF": 100, "RF": 500, "LB": 500, "RB": 500})
+        )
+        self.assertTrue(self._by_id(r_obj)["LF"]["overloaded"])
+
+    def test_merged_coincident_bottom_posts(self):
+        # 两根底层立柱落点完全相同：合并为一个点载荷（均摊后各 50）
+        state = self._rack(
+            [
+                {"id": "P1", "x": 500, "y": 400, "capacity": 0},
+                {"id": "P2", "x": 500, "y": 400, "capacity": 0},
+            ],
+            board_load=(100, 0),
+        )
+        r = wheel_load_trial(state, self._wheels())
+        self.assertEqual(r["pointLoadCount"], 1)
+        p = r["pointLoads"][0]
+        self.assertEqual(p["load"], 100.0)
+        self.assertEqual(len(p["posts"]), 2)
+        self.assertTrue(r["checks"]["balanced"])
+
+    def test_hanging_and_zero_load_bottom_posts_excluded(self):
+        # 一根悬空（x=990 之外？台面 1000 内；放到 y=900 越出台面 d=800）
+        state = self._rack(
+            [
+                {"id": "P1", "x": 500, "y": 400, "capacity": 0},
+                {"id": "HANG", "x": 500, "y": 900, "capacity": 0},  # 越出台面→悬空
+            ],
+            board_load=(100, 0),
+        )
+        r = wheel_load_trial(state, self._wheels())
+        self.assertEqual(r["pointLoadCount"], 1)
+        self.assertEqual(r["pointLoads"][0]["posts"][0]["post"], "P1")
+
+    def test_force_and_moment_checks_match_inputs(self):
+        state = self._rack(
+            [
+                {"id": "P1", "x": 200, "y": 150, "capacity": 0},
+                {"id": "P2", "x": 700, "y": 600, "capacity": 0},
+                {"id": "P3", "x": 500, "y": 400, "capacity": 0},
+            ],
+            board_load=(0, 300),
+        )
+        r = wheel_load_trial(state, self._wheels())
+        chk = r["checks"]
+        self.assertTrue(chk["force"]["ok"])
+        self.assertTrue(chk["momentX"]["ok"])
+        self.assertTrue(chk["momentY"]["ok"])
+        self.assertEqual(chk["force"]["applied"], 300.0)
+        # momentX = ΣP·y：各点 100 → 100*(150+600+400)=115000
+        self.assertEqual(chk["momentX"]["applied"], 115000.0)
+        # momentY = ΣP·x：100*(200+700+500)=140000
+        self.assertEqual(chk["momentY"]["applied"], 140000.0)
+        self.assertEqual(chk["force"]["difference"], 0.0)
+
+    def test_zero_track_x_raises(self):
+        state = self._rack([{"id": "P1", "x": 500, "y": 400, "capacity": 0}])
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, self._wheels(xLeft=300, xRight=300))
+
+    def test_zero_wheelbase_y_raises(self):
+        state = self._rack([{"id": "P1", "x": 500, "y": 400, "capacity": 0}])
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, self._wheels(yFront=300, yBack=300))
+
+    def test_wheel_outside_car_raises(self):
+        state = self._rack([{"id": "P1", "x": 500, "y": 400, "capacity": 0}])
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, self._wheels(xRight=1001))
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, self._wheels(yBack=-1))
+        # 台面边界上允许
+        ok = wheel_load_trial(
+            state, self._wheels(xLeft=0, xRight=1000, yFront=800, yBack=0)
+        )
+        self.assertTrue(ok["evaluable"])
+
+    def test_nonpositive_rated_load_raises(self):
+        state = self._rack([{"id": "P1", "x": 500, "y": 400, "capacity": 0}])
+        for bad in (0, -10, [500, 500, 500, 0], {"LF": -1, "RF": 1, "LB": 1, "RB": 1}):
+            with self.assertRaises(ValueError):
+                wheel_load_trial(state, self._wheels(ratedLoad=bad))
+
+    def test_missing_and_malformed_params_raise(self):
+        state = self._rack([{"id": "P1", "x": 500, "y": 400, "capacity": 0}])
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, {"xLeft": 100, "xRight": 900, "yFront": 700, "yBack": 100})
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, "not-an-object")
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, self._wheels(ratedLoad="heavy"))
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, self._wheels(ratedLoad=[1, 2, 3]))
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, self._wheels(xLeft="abc"))
+        with self.assertRaises(ValueError):
+            wheel_load_trial(state, self._wheels(xLeft=float("inf")))
+
+    def test_no_positive_bottom_load_not_evaluable(self):
+        # 架体有层，但底层没有任何承载立柱（单根悬空，载荷丢失）
+        state = self._rack([{"id": "H", "x": 500, "y": 999, "capacity": 0}])
+        r = wheel_load_trial(state, self._wheels())
+        self.assertFalse(r["evaluable"])
+        self.assertIsNone(r["wheels"])
+        self.assertIsNone(r["checks"])
+        self.assertIn("底层没有正载荷", r["reason"])
+
+    def test_empty_rack_not_evaluable(self):
+        state = {"car": {"w": 1000, "d": 800}, "layers": []}
+        r = wheel_load_trial(state, self._wheels())
+        self.assertFalse(r["evaluable"])
+
+    def test_sample_state_evaluable_and_balanced(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        r = wheel_load_trial(state, self._wheels())
+        self.assertTrue(r["evaluable"])
+        self.assertEqual(r["pointLoadCount"], 5)
+        self.assertTrue(r["checks"]["balanced"])
+        total = sum(w["reaction"] for w in r["wheels"])
+        self.assertAlmostEqual(total, 1980.0, places=4)
+
+    def test_does_not_mutate_input(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        wheels = self._wheels()
+        before = json.loads(json.dumps({"state": state, "wheels": wheels}, ensure_ascii=False))
+        r = wheel_load_trial(state, wheels)
+        self.assertTrue(r["evaluable"])
+        self.assertEqual({"state": state, "wheels": wheels}, before)
 
 
 if __name__ == "__main__":

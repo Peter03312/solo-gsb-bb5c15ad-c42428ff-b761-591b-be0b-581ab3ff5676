@@ -229,6 +229,52 @@
         <div id="doorOutput"></div>
       </div>
 
+      <div class="panel wheel-panel">
+        <div class="sim-head">
+          <h2>🛞 轮组承载试算 <span id="wheelStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelWheel" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnWheel" class="btn btn-run" type="button">开始轮组试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          录入台面内<b>左右轮位 X 坐标</b>、<b>前后轮位 Y 坐标</b>与<b>四轮额定载荷</b>（坐标 mm，载荷 kg）。
+          系统以<b>底层非悬空立柱</b>的落点与实载为点载荷，把台面视为刚性板、四轮矩形刚性支撑，
+          按<b>双向杠杆比例</b>分配轮反力：落点越出轮组矩形时<b>允许外推</b>，出现的
+          <b style="color:var(--error)">负反力不会被截为零</b>（表示该轮需要下拉力、有车轮悬空风险）。
+          页面列出逐轮反力、利用率与超载/负反力风险，并核对<b>四轮反力之和</b>及
+          <b>X / Y 力矩</b>与输入点载荷完全一致。试算只读取当前架体、<span class="hl">不写盘</span>；
+          轮距为 0、轮位越出台面、额定载荷非正时报参数错误；<b>编辑架体后旧结果立即失效</b>。
+        </p>
+        <div class="wheel-form">
+          <label>左轮位 X (mm)
+            <input type="number" step="any" id="wheelXL" value="100" />
+          </label>
+          <label>右轮位 X (mm)
+            <input type="number" step="any" id="wheelXR" value="1200" />
+          </label>
+          <label>前轮位 Y (mm)
+            <input type="number" step="any" id="wheelYF" value="800" />
+          </label>
+          <label>后轮位 Y (mm)
+            <input type="number" step="any" id="wheelYB" value="100" />
+          </label>
+          <label>左前额定 (kg)
+            <input type="number" step="any" id="wheelCapLF" value="600" min="0" />
+          </label>
+          <label>右前额定 (kg)
+            <input type="number" step="any" id="wheelCapRF" value="600" min="0" />
+          </label>
+          <label>左后额定 (kg)
+            <input type="number" step="any" id="wheelCapLB" value="600" min="0" />
+          </label>
+          <label>右后额定 (kg)
+            <input type="number" step="any" id="wheelCapRB" value="600" min="0" />
+          </label>
+        </div>
+        <div id="wheelOutput"></div>
+      </div>
+
       <div class="bottom-grid">
         <div class="panel issues-panel">
           <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>

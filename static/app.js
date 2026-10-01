@@ -71,6 +71,17 @@ let doorErr = null;            // 最近一次参数错误提示（400）
 let doorStale = false;         // 试算后架体/门参数已变化：旧结果失效
 let doorTimer = null;          // 门参数变化后的防抖重算
 
+/* ================= 轮组承载试算状态 =================
+ * wheelInputs 只存在于浏览器（轮位/额定载荷不写入架体状态、不持久化）；
+ * wheelData 只来自 POST /api/wheel-load（或离线兜底），只读不写盘。
+ * 架体或轮组参数改变后旧结果立即作废（stale），需重新试算。
+ */
+let wheelData = null;          // 最近一次轮组试算结果
+let wheelReqSeq = 0;           // 请求序号，丢弃过期响应
+let wheelErr = null;           // 最近一次参数错误提示（400）
+let wheelStale = false;        // 试算后架体/轮组参数已变化：旧结果失效
+let wheelTimer = null;         // 轮组参数变化后的防抖重算
+
 /* ================= 数值/工具 ================= */
 const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
@@ -140,6 +151,8 @@ async function recalcAndRender(applyChange) {
   invalidateSequence({ silent: true });
   // 连续窑门通行试算只依赖架体几何：任何编辑都使旧试算失效
   invalidateDoorTrial({ silent: true });
+  // 轮组承载试算依赖底层立柱落点与实载：任何编辑都使旧试算失效
+  invalidateWheelTrial({ silent: true });
   suggestAppliedMsg = null;
   if (applyChange !== "shed") shedAppliedMsg = null;
   try {
@@ -399,6 +412,7 @@ $("#btnReset").addEventListener("click", async () => {
   invalidateOverturn({ silent: true });
   invalidateSequence({ silent: true });
   invalidateDoorTrial({ silent: true });
+  invalidateWheelTrial({ silent: true });
   suggestAppliedMsg = null;
   shedAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
@@ -427,6 +441,7 @@ function renderResults() {
   renderOverturnPanel();
   renderSeqPanel();
   renderDoorPanel();
+  renderWheelPanel();
 }
 
 function renderTotals() {
@@ -2255,6 +2270,262 @@ function markDoorResultStale() {
   }
 }
 
+/* ================= 轮组承载试算面板 ================= */
+const WHEEL_NAME = { LF: "左前轮", RF: "右前轮", LB: "左后轮", RB: "右后轮" };
+
+function invalidateWheelTrial(opts) {
+  wheelData = null;
+  wheelErr = null;
+  wheelStale = false;
+  wheelReqSeq++;
+  clearTimeout(wheelTimer);
+  if (opts && opts.silent) return;
+  renderWheelPanel();
+}
+
+function wheelInputs() {
+  return {
+    xLeft: parseFloat($("#wheelXL").value),
+    xRight: parseFloat($("#wheelXR").value),
+    yFront: parseFloat($("#wheelYF").value),
+    yBack: parseFloat($("#wheelYB").value),
+    ratedLoad: {
+      LF: parseFloat($("#wheelCapLF").value),
+      RF: parseFloat($("#wheelCapRF").value),
+      LB: parseFloat($("#wheelCapLB").value),
+      RB: parseFloat($("#wheelCapRB").value),
+    },
+  };
+}
+
+function validateWheelInputs(w) {
+  [["xLeft", "左轮位 X"], ["xRight", "右轮位 X"], ["yFront", "前轮位 Y"], ["yBack", "后轮位 Y"]]
+    .forEach(([k, name]) => {
+      if (!Number.isFinite(w[k])) throw new Error(`${name} 坐标必须是数值（mm）`);
+    });
+  [["LF", "左前"], ["RF", "右前"], ["LB", "左后"], ["RB", "右后"]].forEach(([k, name]) => {
+    const v = w.ratedLoad[k];
+    if (!Number.isFinite(v)) throw new Error(`${name}轮额定载荷必须是数值（kg）`);
+    if (v <= 0) throw new Error(`${name}轮额定载荷必须为正数（kg）`);
+  });
+  // 几何/越界错误后端会按现场台面精确复核（400），这里仅提前拦截坐标非数值与额定非正
+}
+
+async function runWheelTrial() {
+  const wheels = wheelInputs();
+  const s = collectState();
+  try {
+    validateWheelInputs(wheels);
+  } catch (e) {
+    wheelData = null;
+    wheelErr = e.message;
+    wheelStale = false;
+    renderWheelPanel();
+    return;
+  }
+  const status = $("#wheelStatus");
+  wheelErr = null;
+  wheelStale = false;
+  status.textContent = "试算中…";
+  status.className = "badge";
+  const seq = ++wheelReqSeq;
+  let data;
+  try {
+    const res = await fetch("/api/wheel-load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state: s, wheels }),
+    });
+    data = await res.json();
+    if (!res.ok) {
+      if (seq !== wheelReqSeq) return;
+      wheelData = null;
+      wheelErr = (data && data.error) || `试算失败（HTTP ${res.status}）`;
+      renderWheelPanel();
+      return;
+    }
+  } catch (err) {
+    data = wheelLoadLocal(s, wheels); // 离线兜底：与后端同一套算法
+  }
+  if (seq !== wheelReqSeq) return; // 期间已有编辑/重置，丢弃过期响应
+  wheelData = data;
+  renderWheelPanel();
+}
+
+function cancelWheelTrial() {
+  invalidateWheelTrial();
+}
+
+function markWheelResultStale() {
+  wheelErr = null;
+  if (wheelData && !wheelStale) {
+    wheelStale = true;
+    renderWheelPanel();
+  }
+}
+
+function scheduleWheelRun() {
+  clearTimeout(wheelTimer);
+  wheelTimer = setTimeout(() => {
+    if (wheelData || wheelErr) runWheelTrial();
+  }, 300);
+}
+
+function wheelCheckText(chk) {
+  if (!chk) return "";
+  const row = (label, c) => {
+    const sign = c.ok ? '<span class="good">✓ 一致</span>' : '<span class="bad">✕ 不一致</span>';
+    return `<tr>
+      <td>${label}（${c.about || ""}）</td>
+      <td>${fmt(c.applied)} <small>${c.unit}</small></td>
+      <td>${fmt(c.reaction)} <small>${c.unit}</small></td>
+      <td>${fmt(c.difference)}</td>
+      <td>${sign}</td>
+    </tr>`;
+  };
+  return `<div class="wheel-check-wrap">
+    <table class="src-table sug-table ov-table wheel-table">
+      <tr class="head"><td>核对项</td><td>输入点载荷合计</td><td>四轮反力合计</td><td>差值</td><td>判定</td></tr>
+      ${row("竖向力 ΣF", { ...chk.force, about: "ΣP = ΣR" })}
+      ${row("力矩 momentX", chk.momentX)}
+      ${row("力矩 momentY", chk.momentY)}
+    </table>
+    <p class="hint" style="margin:2px 0 0">
+      力矩单位 kg·mm：momentX = 绕 X 轴 ΣP·y，momentY = 绕 Y 轴 ΣP·x；
+      整体平衡：<b class="${chk.balanced ? "good" : "bad"}">${chk.balanced ? "✓ 力与 X/Y 力矩全部平衡" : "✕ 平衡核对未通过"}</b>。
+    </p>
+  </div>`;
+}
+
+function renderWheelPanel() {
+  const out = $("#wheelOutput");
+  const status = $("#wheelStatus");
+  const btnCancel = $("#btnCancelWheel");
+  if (!out) return;
+  btnCancel.disabled = !wheelData && !wheelErr && !wheelStale;
+
+  if (wheelErr) {
+    status.textContent = "参数有误";
+    status.className = "badge";
+    out.innerHTML = `<p class="ov-reason">⚠ ${escapeHtml(wheelErr)}</p>`;
+    return;
+  }
+  if (!wheelData) {
+    status.textContent = wheelStale ? "结果已失效" : "未试算";
+    status.className = "badge" + (wheelStale ? " stale" : "");
+    out.innerHTML = wheelStale
+      ? `<p class="ov-reason">⚠ 架体或轮组参数已改变，旧试算结果已失效，请重新点击「开始轮组试算」。</p>`
+      : `<p class="muted" style="margin:8px 0 0">录入台面内左右轮位 X、前后轮位 Y（mm）与四轮额定载荷（kg）后点击「开始轮组试算」。
+         负反力会原样保留（车轮需下拉力），不会截为零；试算只读不写盘，编辑架体后旧结果立即失效。</p>`;
+    return;
+  }
+
+  const d = wheelData;
+  if (wheelStale) {
+    status.textContent = "结果已失效";
+    status.className = "badge stale";
+  } else if (!d.evaluable) {
+    status.textContent = "无法试算";
+    status.className = "badge";
+  } else if (d.risks.anyOverloaded) {
+    status.textContent = "存在超载";
+    status.className = "badge has-door blocked";
+  } else if (d.risks.anyNegative) {
+    status.textContent = "负反力风险";
+    status.className = "badge has-door blocked";
+  } else {
+    status.textContent = "四轮均合格";
+    status.className = "badge has-door";
+  }
+
+  let body = `
+    <div class="door-profile wheel-layout">
+      <span>台面 <b>${fmt(d.car.w)} × ${fmt(d.car.d)}</b> mm</span>
+      <span>左右轨距 <b>${fmt(d.layout.trackX)}</b> mm</span>
+      <span>前后轴距 <b>${fmt(d.layout.wheelbaseY)}</b> mm</span>
+      <span>有效点载荷 <b>${d.evaluable ? d.pointLoadCount : 0}</b> 个</span>
+    </div>`;
+
+  if (!d.evaluable) {
+    out.innerHTML = body + `<p class="ov-reason">🚫 <b>无法试算：</b>${escapeHtml(d.reason || "架体条件不足")}</p>`;
+    return;
+  }
+
+  const r = d.risks;
+  const banners = [];
+  if (r.anyOverloaded) {
+    banners.push(`<p class="ov-reason">⚠ <b>超载风险：</b>轮位 ${r.overloadedWheels.map((w) => WHEEL_NAME[w]).join("、")} 的反力超过额定载荷，请减重或调整装载/轮位。</p>`);
+  }
+  if (r.anyNegative) {
+    banners.push(`<p class="ov-reason">⚠ <b>负反力风险：</b>轮位 ${r.negativeWheels.map((w) => WHEEL_NAME[w]).join("、")} 算得负反力——该轮需要向下拉住台面（实际会悬空/上跳），说明载荷合力已偏出轮组矩形，不得把负反力截为零。</p>`);
+  }
+  if (r.extrapolated) {
+    banners.push(`<p class="hint" style="margin:4px 0 0">有 <b>${r.outsidePointCount}</b> 个点载荷落在轮组矩形之外，结果按双向杠杆<b>外推</b>得到（权重为负），力与力矩仍然严格平衡。</p>`);
+  }
+  if (!r.anyOverloaded && !r.anyNegative) {
+    banners.push(`<p class="sug-applied" style="margin:6px 0 0">✓ 四轮反力均为正且不超额定载荷。载荷合力中心 (${fmt(d.loadCenter.x)}, ${fmt(d.loadCenter.y)})${d.loadCenter.insideWheelRect ? "位于" : "<b>不在</b>"}轮组矩形内。</p>`);
+  }
+  body += banners.join("");
+
+  const wheelRows = d.wheels.map((w) => {
+    const cls = w.overloaded ? "bad" : w.negative ? "warn" : "good";
+    const tags = [];
+    if (w.overloaded) tags.push('<span class="w-tag bad">超载</span>');
+    if (w.negative) tags.push('<span class="w-tag warn">负反力</span>');
+    if (!tags.length) tags.push('<span class="w-tag good">正常</span>');
+    const pct = Math.round(w.utilization * 1000) / 10;
+    return `<tr class="${w.overloaded || w.negative ? "blocked" : ""}">
+      <td><b>${w.name}</b><br><small>${w.id} (${fmt(w.x)}, ${fmt(w.y)})</small></td>
+      <td><b>${fmt(w.reaction)}</b></td>
+      <td>${fmt(w.ratedLoad)}</td>
+      <td class="${cls}"><b>${pct}%</b>${
+        w.negative ? '<br><small>负值：该轮需下拉力</small>' : ""
+      }</td>
+      <td>${tags.join(" ")}</td>
+    </tr>`;
+  }).join("");
+  body += `
+    <div class="wheel-table-wrap">
+      <table class="src-table sug-table ov-table wheel-table">
+        <tr class="head"><td>车轮</td><td>反力 (kg)</td><td>额定 (kg)</td><td>利用率</td><td>判定</td></tr>
+        ${wheelRows}
+      </table>
+    </div>`;
+
+  const pointRows = d.pointLoads.map((p) => {
+    const labels = p.posts.map((q) => escapeHtml(q.label)).join("、");
+    const weights = ["LF", "RF", "LB", "RB"].map((k) => `<small>${WHEEL_NAME[k]} ${fmt(p.weights[k])}</small>`).join(" ");
+    return `<tr class="${p.outside ? "blocked" : ""}">
+      <td>(${fmt(p.x)}, ${fmt(p.y)})${p.outside ? ' <span class="w-tag warn">矩形外·外推</span>' : ""}</td>
+      <td><b>${fmt(p.load)}</b></td>
+      <td>${labels}</td>
+      <td>${weights}</td>
+    </tr>`;
+  }).join("");
+  body += `
+    <details class="wheel-points" ${r.extrapolated ? "open" : ""}>
+      <summary>底层点载荷与四轮分配权重（${d.pointLoadCount} 个）</summary>
+      <div class="wheel-table-wrap">
+        <table class="src-table sug-table ov-table wheel-table">
+          <tr class="head"><td>落点 (x, y) mm</td><td>实载 (kg)</td><td>来源立柱</td><td>四轮权重</td></tr>
+          ${pointRows}
+        </table>
+      </div>
+    </details>`;
+
+  body += wheelCheckText(d.checks);
+  out.innerHTML = body;
+}
+
+$("#btnWheel").addEventListener("click", runWheelTrial);
+$("#btnCancelWheel").addEventListener("click", cancelWheelTrial);
+document.querySelectorAll(".wheel-form input").forEach((el) => {
+  el.addEventListener("input", () => {
+    markWheelResultStale();
+    scheduleWheelRun();
+  });
+});
+
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
 
@@ -3369,5 +3640,184 @@ function doorPassageLocal(rawState, rawDoors) {
     passable: blockedAt === null, blockedAt, blockReason,
     doors: rows, positions,
     note: m === 0 ? "未录入窑门，按全程可达处理（没有需要通过的门）" : null,
+  };
+}
+
+/* ======================================================================
+ * 轮组承载试算离线兜底：与 app/calc.py 的 wheel_load_trial 同一套算法
+ * （calculateLocal 已给出整架分摊结果，这里取底层非悬空立柱点载荷做双线性分配）
+ * ==================================================================== */
+function wheelLoadLocal(rawState, rawWheels) {
+  const numf = (v, name) => {
+    const f = parseFloat(v);
+    if (!Number.isFinite(f)) throw new Error(`${name}必须是数值`);
+    return f;
+  };
+  const w = rawWheels || {};
+  const xl = numf(w.xLeft, "左轮位 X 坐标 xLeft");
+  const xr = numf(w.xRight, "右轮位 X 坐标 xRight");
+  const yf = numf(w.yFront, "前轮位 Y 坐标 yFront");
+  const yb = numf(w.yBack, "后轮位 Y 坐标 yBack");
+
+  const parseRated = () => {
+    const src0 = w.ratedLoad;
+    if (src0 == null) throw new Error("缺少必填参数：四轮额定载荷 ratedLoad");
+    let vals;
+    if (typeof src0 === "number") {
+      if (!Number.isFinite(src0)) throw new Error("四轮额定载荷必须是有限数值（kg）");
+      vals = { LF: src0, RF: src0, LB: src0, RB: src0 };
+    } else if (Array.isArray(src0)) {
+      if (src0.length !== 4) throw new Error("四轮额定载荷数组长度必须为 4（顺序：左前、右前、左后、右后）");
+      vals = {};
+      ["LF", "RF", "LB", "RB"].forEach((k, i) => {
+        const f = parseFloat(src0[i]);
+        if (!Number.isFinite(f)) throw new Error("四轮额定载荷必须是数值（kg）");
+        vals[k] = f;
+      });
+    } else if (typeof src0 === "object") {
+      vals = {};
+      ["LF", "RF", "LB", "RB"].forEach((k) => {
+        if (src0[k] == null) throw new Error(`缺少${WHEEL_NAME[k]}（${k}）的额定载荷`);
+        const f = parseFloat(src0[k]);
+        if (!Number.isFinite(f)) throw new Error(`${WHEEL_NAME[k]}额定载荷必须是数值（kg）`);
+        vals[k] = f;
+      });
+    } else throw new Error("四轮额定载荷必须是标量、长度 4 的数组或 {LF,RF,LB,RB} 对象");
+    Object.keys(vals).forEach((k) => {
+      if (vals[k] <= 0) throw new Error(`${WHEEL_NAME[k]}额定载荷必须为正数（kg），收到 ${vals[k]}`);
+    });
+    return vals;
+  };
+  const rated = parseRated();
+
+  const calc = calculateLocal(rawState);
+  const car = calc.car;
+  const carW = car.w, carD = car.d;
+
+  if (xr - xl === 0) throw new Error(`轮距不正：左右轮位 X 坐标相同（xLeft=xRight=${r2(xl)} mm），左右轨距不能为 0`);
+  if (yf - yb === 0) throw new Error(`轮距不正：前后轮位 Y 坐标相同（yFront=yBack=${r2(yf)} mm），前后轴距不能为 0`);
+  [[xl, "左轮位 X 坐标 xLeft", carW, "X"], [xr, "右轮位 X 坐标 xRight", carW, "X"]]
+    .forEach(([v, name, lim, axis]) => {
+      if (!(v >= 0 && v <= lim)) throw new Error(`坐标越出台面：${name}=${r2(v)} mm 不在台面 ${axis} 向 [0, ${r2(lim)}] mm 内`);
+    });
+  [[yf, "前轮位 Y 坐标 yFront"], [yb, "后轮位 Y 坐标 yBack"]].forEach(([v, name]) => {
+    if (!(v >= 0 && v <= carD)) throw new Error(`坐标越出台面：${name}=${r2(v)} mm 不在台面 Y 向 [0, ${r2(carD)}] mm 内`);
+  });
+
+  const base = {
+    car: { name: car.name, w: r2(carW), d: r2(carD) },
+    layout: {
+      xLeft: r2(xl), xRight: r2(xr), yFront: r2(yf), yBack: r2(yb),
+      trackX: r2(Math.abs(xr - xl)), wheelbaseY: r2(Math.abs(yf - yb)),
+    },
+  };
+  const wheelXy = { LF: [xl, yf], RF: [xr, yf], LB: [xl, yb], RB: [xr, yb] };
+
+  // 底层非悬空、实载为正的立柱，按 (x,y) 合并
+  const bottom = calc.layers[0];
+  const merged = new Map();
+  if (bottom) {
+    bottom.posts.forEach((p) => {
+      if (p.hanging || !(p.load > 0)) return;
+      const key = p.x + "|" + p.y;
+      if (!merged.has(key)) {
+        merged.set(key, { x: p.x, y: p.y, load: 0, posts: [] });
+      }
+      const item = merged.get(key);
+      item.load += p.load;
+      item.posts.push({ layer: 0, post: p.id, label: `${bottom.name}·${p.id}` });
+    });
+  }
+  // 排序与 Python 端一致：按 (x, y) 坐标元组，而不是字符串键（避免 "1000" < "150"）
+  const pointList = [...merged.values()].sort((p, q) =>
+    (p.x - q.x) || (p.y - q.y));
+
+  if (!pointList.length) {
+    return {
+      ok: true, ...base, evaluable: false,
+      reason: "底层没有正载荷的非悬空立柱：台面未收到任何可向车轮分配的点载荷，无法进行轮组承载试算，请先检查底层立柱布置与整架载荷",
+      pointLoads: [], wheels: null, checks: null, risks: null,
+    };
+  }
+
+  const IDS = ["LF", "RF", "LB", "RB"];
+  const xmin = Math.min(xl, xr), xmax = Math.max(xl, xr);
+  const ymin = Math.min(yb, yf), ymax = Math.max(yb, yf);
+  const reactions = { LF: 0, RF: 0, LB: 0, RB: 0 };
+  const pointRows = [];
+  let outsideCount = 0, appliedSum = 0, appliedSx = 0, appliedSy = 0;
+
+  pointList.forEach((pt) => {
+    const px = pt.x, py = pt.y, P = pt.load;
+    const a = (xr - px) / (xr - xl); // 左权重
+    const c = (py - yb) / (yf - yb); // 前权重
+    const wmap = { LF: a * c, RF: (1 - a) * c, LB: a * (1 - c), RB: (1 - a) * (1 - c) };
+    const outside = !(px >= xmin && px <= xmax && py >= ymin && py <= ymax);
+    if (outside) outsideCount++;
+    const contributions = [];
+    IDS.forEach((k) => {
+      const amt = P * wmap[k];
+      reactions[k] += amt;
+      contributions.push({ wheel: k, amount: r2(amt) });
+    });
+    appliedSum += P;
+    appliedSx += P * px;
+    appliedSy += P * py;
+    pointRows.push({
+      x: r2(px), y: r2(py), load: r2(P), posts: pt.posts, outside,
+      weights: { LF: r2(wmap.LF), RF: r2(wmap.RF), LB: r2(wmap.LB), RB: r2(wmap.RB) },
+      contributions,
+    });
+  });
+
+  const EPS = 1e-9;
+  const wheelRows = [];
+  const overloadedIds = [], negativeIds = [];
+  IDS.forEach((k) => {
+    const rv = reactions[k], cap = rated[k];
+    const overloaded = rv > cap + EPS;
+    const negative = rv < -EPS;
+    if (overloaded) overloadedIds.push(k);
+    if (negative) negativeIds.push(k);
+    wheelRows.push({
+      id: k, name: WHEEL_NAME[k], x: r2(wheelXy[k][0]), y: r2(wheelXy[k][1]),
+      ratedLoad: r2(cap), reaction: r2(rv), utilization: r2(rv / cap),
+      overloaded, negative,
+    });
+  });
+
+  const reactSum = IDS.reduce((s, k) => s + reactions[k], 0);
+  const reactSx = IDS.reduce((s, k) => s + reactions[k] * wheelXy[k][0], 0);
+  const reactSy = IDS.reduce((s, k) => s + reactions[k] * wheelXy[k][1], 0);
+  const checkRow = (applied, got) => {
+    const diff = got - applied;
+    const tol = Math.max(1e-6 * Math.max(1, Math.abs(applied), Math.abs(got)), 0.01);
+    return { applied: r2(applied), reaction: r2(got), difference: r2(diff), ok: Math.abs(diff) <= tol };
+  };
+  const fChk = checkRow(appliedSum, reactSum);
+  const sxChk = checkRow(appliedSx, reactSx);
+  const syChk = checkRow(appliedSy, reactSy);
+  const cx = appliedSum ? appliedSx / appliedSum : 0;
+  const cy = appliedSum ? appliedSy / appliedSum : 0;
+
+  return {
+    ok: true, ...base, evaluable: true, reason: null,
+    pointLoadCount: pointRows.length, pointLoads: pointRows,
+    loadCenter: {
+      x: r2(cx), y: r2(cy),
+      insideWheelRect: cx >= xmin && cx <= xmax && cy >= ymin && cy <= ymax,
+    },
+    wheels: wheelRows,
+    checks: {
+      force: { ...fChk, unit: "kg" },
+      momentX: { ...syChk, unit: "kg·mm", about: "X 轴（ΣP·y）" },
+      momentY: { ...sxChk, unit: "kg·mm", about: "Y 轴（ΣP·x）" },
+      balanced: fChk.ok && sxChk.ok && syChk.ok,
+    },
+    risks: {
+      overloadedWheels: overloadedIds, negativeWheels: negativeIds,
+      extrapolated: outsideCount > 0, outsidePointCount: outsideCount,
+      anyOverloaded: overloadedIds.length > 0, anyNegative: negativeIds.length > 0,
+    },
   };
 }

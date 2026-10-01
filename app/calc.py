@@ -2271,3 +2271,346 @@ def door_passage(
         "positions": positions,
         "note": note,
     }
+
+# --------------------------------------------------------------------------
+# 轮组承载试算（Wheel-Group Load Trial）
+#
+# 窑车台面由四角的四个车轮（矩形布置）承托。台面承接底层（第 0 层）非悬空
+# 立柱传来的点载荷 P_k(x_k, y_k) 后，把台面视为刚性板、四轮为四点刚性支撑，
+# 按*双向杠杆（双线性）比例*把每个点载荷分配到四轮：
+#   记左轮位 xL、右轮位 xR，前轮位 yF、后轮位 yB（dx=xR-xL，dy=yF-yB 均非 0），
+#   左/右权重  a=(xR-x)/dx, 1-a；  前/后权重 c=(y-yB)/dy, 1-c；
+#   则 R_LF=P·a·c, R_RF=P·(1-a)c, R_LB=P·a(1-c), R_RB=P·(1-a)(1-c)。
+# 该分配自动满足竖向力平衡与对 X、Y 轴的力矩平衡（四个权重之和恒为 1）。
+# 落点位于轮组矩形之外时权重出现负值——*允许外推、绝不把负反力截为零*：
+# 负反力表示该轮需要向下拉住台面，现场即车轮“悬空/上跳”风险，必须原样报出。
+# 整个过程只读：基于现有整架计算结果取底层非悬空立柱的落点与实载，不修改输入、不写盘。
+# --------------------------------------------------------------------------
+WHEEL_TRIAL_EPS = 1e-9
+
+# 四轮输出顺序：左前、右前、左后、右后
+WHEEL_IDS = ("LF", "RF", "LB", "RB")
+WHEEL_NAMES = {
+    "LF": "左前轮",
+    "RF": "右前轮",
+    "LB": "左后轮",
+    "RB": "右后轮",
+}
+
+_XL_KEYS = ("xLeft", "xl", "x_left", "xL")
+_XR_KEYS = ("xRight", "xr", "x_right", "xR")
+_YF_KEYS = ("yFront", "yf", "y_front", "yF")
+_YB_KEYS = ("yBack", "yb", "y_back", "yB")
+_RATED_KEYS = ("ratedLoad", "rated", "ratedLoads", "capacity")
+
+
+def _wheel_field(raw: Dict[str, Any], keys: Tuple[str, ...], name: str) -> float:
+    for k in keys:
+        if k in raw and raw[k] is not None:
+            try:
+                v = float(raw[k])
+            except (TypeError, ValueError):
+                raise ValueError(f"{name}必须是数值（mm）")
+            if not math.isfinite(v):
+                raise ValueError(f"{name}必须是有限数值（mm）")
+            return v
+    raise ValueError(f"缺少必填参数：{name}")
+
+
+def _parse_rated_loads(raw: Any) -> Dict[str, float]:
+    """四轮额定载荷（kg）：接受标量（四轮相同）、长度 4 数组（LF,RF,LB,RB）或
+    {LF,RF,LB,RB} 对象；非有限数值或非正值抛 ValueError（API → 400）。"""
+    src: Any = None
+    present = False
+    if isinstance(raw, dict):
+        for k in _RATED_KEYS:
+            if k in raw and raw[k] is not None:
+                src = raw[k]
+                present = True
+                break
+    if not present:
+        raise ValueError("缺少必填参数：四轮额定载荷 ratedLoad（标量或长度 4 的数组）")
+
+    vals: Dict[str, float] = {}
+    if isinstance(src, (int, float)) and not isinstance(src, bool):
+        fv = float(src)
+        if not math.isfinite(fv):
+            raise ValueError("四轮额定载荷必须是有限数值（kg）")
+        vals = {wid: fv for wid in WHEEL_IDS}
+    elif isinstance(src, list):
+        if len(src) != 4:
+            raise ValueError("四轮额定载荷数组长度必须为 4（顺序：左前、右前、左后、右后）")
+        out = []
+        for v in src:
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                raise ValueError("四轮额定载荷必须是数值（kg）")
+            if not math.isfinite(fv):
+                raise ValueError("四轮额定载荷必须是有限数值（kg）")
+            out.append(fv)
+        vals = dict(zip(WHEEL_IDS, out))
+    elif isinstance(src, dict):
+        for wid in WHEEL_IDS:
+            if wid not in src or src[wid] is None:
+                raise ValueError(f"缺少 {WHEEL_NAMES[wid]}（{wid}）的额定载荷")
+            try:
+                fv = float(src[wid])
+            except (TypeError, ValueError):
+                raise ValueError(f"{WHEEL_NAMES[wid]}额定载荷必须是数值（kg）")
+            if not math.isfinite(fv):
+                raise ValueError(f"{WHEEL_NAMES[wid]}额定载荷必须是有限数值（kg）")
+            vals[wid] = fv
+    else:
+        raise ValueError("四轮额定载荷必须是标量、长度 4 的数组或 {LF,RF,LB,RB} 对象")
+
+    for wid, fv in vals.items():
+        if fv <= 0:
+            raise ValueError(f"{WHEEL_NAMES[wid]}额定载荷必须为正数（kg），收到 {fv}")
+    return vals
+
+
+def _parse_wheel_params(
+    raw: Any,
+) -> Tuple[float, float, float, float, Dict[str, float]]:
+    if not isinstance(raw, dict):
+        raise ValueError("轮组参数必须是 JSON 对象：xLeft/xRight/yFront/yBack/ratedLoad")
+    xl = _wheel_field(raw, _XL_KEYS, "左轮位 X 坐标 xLeft")
+    xr = _wheel_field(raw, _XR_KEYS, "右轮位 X 坐标 xRight")
+    yf = _wheel_field(raw, _YF_KEYS, "前轮位 Y 坐标 yFront")
+    yb = _wheel_field(raw, _YB_KEYS, "后轮位 Y 坐标 yBack")
+    rated = _parse_rated_loads(raw)
+    return xl, xr, yf, yb, rated
+
+
+def _bilinear_weights(
+    x: float, y: float, xl: float, xr: float, yf: float, yb: float
+) -> Tuple[float, float, float, float]:
+    """单个点载荷到四轮（LF,RF,LB,RB）的双向杠杆权重，落点在矩形外自动取负。"""
+    a = (xr - x) / (xr - xl)  # 左权重
+    c = (y - yb) / (yf - yb)  # 前权重
+    return a * c, (1.0 - a) * c, a * (1.0 - c), (1.0 - a) * (1.0 - c)
+
+
+def wheel_load_trial(raw_state: Optional[Dict[str, Any]], raw_wheels: Any) -> Dict[str, Any]:
+    """轮组承载试算：底层非悬空立柱点载荷按矩形四轮双向杠杆比例分配轮压。
+
+    参数
+    ----
+    raw_state  : 当前架体输入（不被修改、不被持久化）
+    raw_wheels : {"xLeft","xRight","yFront","yBack"(mm)，"ratedLoad"(kg)}；
+                 ratedLoad 可为标量、长度 4 数组或 {LF,RF,LB,RB}。
+                 轮位重合（轮距为 0）、轮位越出台面、额定载荷非正 → ValueError（API 400）。
+
+    返回
+    ----
+    evaluable=False（底层没有正载荷）时给 reason；否则给出逐轮反力、利用率、
+    超载/负反力标记、逐点外推标记，以及力与 X/Y 力矩平衡核对（输入点载荷 vs
+    四轮反力）。负反力原样保留（表示该轮需下拉力、有悬空风险），绝不截为零。
+    """
+    xl, xr, yf, yb, rated = _parse_wheel_params(raw_wheels)
+    norm = normalize(raw_state)
+    car = norm["car"]
+    car_w, car_d = car["w"], car["d"]
+
+    # 轮距不正：左右轮 X 相同（轨距 0）或前后轮 Y 相同（轴距 0），矩形退化无法分配
+    if xr - xl == 0.0:
+        raise ValueError(
+            f"轮距不正：左右轮位 X 坐标相同（xLeft=xRight={r2(xl)} mm），"
+            "左右轨距不能为 0"
+        )
+    if yf - yb == 0.0:
+        raise ValueError(
+            f"轮距不正：前后轮位 Y 坐标相同（yFront=yBack={r2(yf)} mm），"
+            "前后轴距不能为 0"
+        )
+    # 轮位必须在台面矩形 [0,w]×[0,d] 内
+    for name, v, side in (
+        ("左轮位 X 坐标 xLeft", xl, "w"),
+        ("右轮位 X 坐标 xRight", xr, "w"),
+    ):
+        if not (0.0 <= v <= car_w):
+            raise ValueError(
+                f"坐标越出台面：{name}={r2(v)} mm 不在台面 X 向 [0, {r2(car_w)}] mm 内"
+            )
+    for name, v in (
+        ("前轮位 Y 坐标 yFront", yf),
+        ("后轮位 Y 坐标 yBack", yb),
+    ):
+        if not (0.0 <= v <= car_d):
+            raise ValueError(
+                f"坐标越出台面：{name}={r2(v)} mm 不在台面 Y 向 [0, {r2(car_d)}] mm 内"
+            )
+
+    wheel_xy = {
+        "LF": (xl, yf),
+        "RF": (xr, yf),
+        "LB": (xl, yb),
+        "RB": (xr, yb),
+    }
+    base = {
+        "car": {"name": car["name"], "w": r2(car_w), "d": r2(car_d)},
+        "layout": {
+            "xLeft": r2(xl),
+            "xRight": r2(xr),
+            "yFront": r2(yf),
+            "yBack": r2(yb),
+            "trackX": r2(abs(xr - xl)),
+            "wheelbaseY": r2(abs(yf - yb)),
+        },
+    }
+
+    # ---- 从现有整架计算结果取底层非悬空立柱的落点与实载（同坐标落点合并） ----
+    res = _calculate(norm)
+    bottom = res["layers"][0] if res["layers"] else None
+    point_list: List[Dict[str, Any]] = []
+    if bottom is not None:
+        merged: Dict[Tuple[float, float], Dict[str, Any]] = {}
+        for po in bottom["posts"]:
+            if po["hanging"] or po["load"] <= 0.0:
+                continue
+            key = (po["x"], po["y"])
+            item = merged.setdefault(
+                key,
+                {
+                    "x": po["x"],
+                    "y": po["y"],
+                    "load": 0.0,
+                    "posts": [],
+                },
+            )
+            item["load"] += po["load"]
+            item["posts"].append(
+                {"layer": 0, "post": po["id"], "label": _post_label(bottom["name"], po["id"])}
+            )
+        point_list = [merged[k] for k in sorted(merged)]
+
+    if not point_list:
+        return {
+            **base,
+            "evaluable": False,
+            "reason": (
+                "底层没有正载荷的非悬空立柱：台面未收到任何可向车轮分配的点载荷，"
+                "无法进行轮组承载试算，请先检查底层立柱布置与整架载荷"
+            ),
+            "pointLoads": [],
+            "wheels": None,
+            "checks": None,
+            "risks": None,
+        }
+
+    xmin, xmax = min(xl, xr), max(xl, xr)
+    ymin, ymax = min(yb, yf), max(yb, yf)
+
+    reactions = {wid: 0.0 for wid in WHEEL_IDS}
+    point_rows: List[Dict[str, Any]] = []
+    outside_count = 0
+    applied_sum = 0.0
+    applied_sx = 0.0  # ΣP·x：对 Y 轴的一阶矩
+    applied_sy = 0.0  # ΣP·y：对 X 轴的一阶矩
+
+    for pt in point_list:
+        px, py, play = pt["x"], pt["y"], pt["load"]
+        w_lf, w_rf, w_lb, w_rb = _bilinear_weights(px, py, xl, xr, yf, yb)
+        wmap = {"LF": w_lf, "RF": w_rf, "LB": w_lb, "RB": w_rb}
+        outside = not (
+            xmin <= px <= xmax and ymin <= py <= ymax
+        )
+        if outside:
+            outside_count += 1
+        contributions = []
+        for wid in WHEEL_IDS:
+            amount = play * wmap[wid]
+            reactions[wid] += amount
+            contributions.append({"wheel": wid, "amount": r2(amount)})
+        applied_sum += play
+        applied_sx += play * px
+        applied_sy += play * py
+        point_rows.append(
+            {
+                "x": r2(px),
+                "y": r2(py),
+                "load": r2(play),
+                "posts": pt["posts"],
+                "outside": outside,
+                "weights": {wid: r2(wmap[wid]) for wid in WHEEL_IDS},
+                "contributions": contributions,
+            }
+        )
+
+    wheel_rows: List[Dict[str, Any]] = []
+    overloaded_ids: List[str] = []
+    negative_ids: List[str] = []
+    for wid in WHEEL_IDS:
+        wx, wy = wheel_xy[wid]
+        r = reactions[wid]
+        cap = rated[wid]
+        overloaded = r > cap + WHEEL_TRIAL_EPS
+        negative = r < -WHEEL_TRIAL_EPS
+        if overloaded:
+            overloaded_ids.append(wid)
+        if negative:
+            negative_ids.append(wid)
+        wheel_rows.append(
+            {
+                "id": wid,
+                "name": WHEEL_NAMES[wid],
+                "x": r2(wx),
+                "y": r2(wy),
+                "ratedLoad": r2(cap),
+                "reaction": r2(r),
+                "utilization": r2(r / cap),
+                "overloaded": overloaded,
+                "negative": negative,
+            }
+        )
+
+    # ---- 平衡核对：四轮反力之和 / ΣR·x / ΣR·y 必须与输入点载荷一致 ----
+    react_sum = sum(reactions.values())
+    react_sx = sum(reactions[wid] * wheel_xy[wid][0] for wid in WHEEL_IDS)
+    react_sy = sum(reactions[wid] * wheel_xy[wid][1] for wid in WHEEL_IDS)
+
+    def check_row(applied: float, got: float) -> Dict[str, Any]:
+        diff = got - applied
+        tol = max(1e-6 * max(1.0, abs(applied), abs(got)), 0.01)
+        return {
+            "applied": r2(applied),
+            "reaction": r2(got),
+            "difference": r2(diff),
+            "ok": abs(diff) <= tol,
+        }
+
+    f_check = check_row(applied_sum, react_sum)
+    sx_check = check_row(applied_sx, react_sx)
+    sy_check = check_row(applied_sy, react_sy)
+    balanced = f_check["ok"] and sx_check["ok"] and sy_check["ok"]
+
+    cx = applied_sx / applied_sum if applied_sum else 0.0
+    cy = applied_sy / applied_sum if applied_sum else 0.0
+    center_inside = xmin <= cx <= xmax and ymin <= cy <= ymax
+
+    return {
+        **base,
+        "evaluable": True,
+        "reason": None,
+        "pointLoadCount": len(point_rows),
+        "pointLoads": point_rows,
+        "loadCenter": {"x": r2(cx), "y": r2(cy), "insideWheelRect": center_inside},
+        "wheels": wheel_rows,
+        "checks": {
+            # force 单位 kg；momentX/momentY 单位 kg·mm
+            "force": {**f_check, "unit": "kg"},
+            # momentX = 绕 X 轴一阶矩 ΣP·y；momentY = 绕 Y 轴一阶矩 ΣP·x
+            "momentX": {**sy_check, "unit": "kg·mm", "about": "X 轴（ΣP·y）"},
+            "momentY": {**sx_check, "unit": "kg·mm", "about": "Y 轴（ΣP·x）"},
+            "balanced": balanced,
+        },
+        "risks": {
+            "overloadedWheels": overloaded_ids,
+            "negativeWheels": negative_ids,
+            "extrapolated": outside_count > 0,
+            "outsidePointCount": outside_count,
+            "anyOverloaded": bool(overloaded_ids),
+            "anyNegative": bool(negative_ids),
+        },
+    }

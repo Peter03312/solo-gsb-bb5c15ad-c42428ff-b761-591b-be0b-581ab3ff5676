@@ -464,3 +464,32 @@ ul.sug-issues li.is-removed .itype { color: var(--normal); }
   .sug-issue-cols { grid-template-columns: 1fr; }
   .door-row { grid-template-columns: 22px repeat(2, 1fr) auto; }
 }
+
+/* ---------- 轮组承载试算 ---------- */
+.wheel-panel { border-style: dashed; border-color: #b07030; }
+.wheel-panel .btn-run { border-color: #f0a04c; color: #f0a04c; }
+.wheel-panel .btn-run:hover { background: rgba(240,160,76,0.12); }
+.wheel-form {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 12px;
+  margin: 8px 0 4px;
+}
+.wheel-table-wrap { max-height: 300px; overflow: auto; margin: 6px 0; }
+.wheel-table td.good { color: var(--normal); }
+.wheel-table td.bad { color: var(--error); }
+.wheel-table td.warn { color: var(--warn); }
+.wheel-table tr.blocked td { background: rgba(239,91,107,0.08); }
+.wheel-table td small { color: var(--muted); font-size: 10px; }
+.w-tag {
+  display: inline-block; border-radius: 10px; padding: 0 8px; font-size: 10px;
+  border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+}
+.w-tag.good { color: var(--normal); border-color: var(--normal); }
+.w-tag.warn { color: var(--warn); border-color: var(--warn); }
+.w-tag.bad { color: var(--error); border-color: var(--error); }
+.wheel-points summary {
+  cursor: pointer; font-size: 12px; color: var(--accent); margin: 4px 0;
+}
+.wheel-check-wrap { margin-top: 4px; }
+@media (max-width: 1200px) {
+  .wheel-form { grid-template-columns: 1fr 1fr; }
+}
